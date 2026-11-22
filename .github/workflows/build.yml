@@ -1,7 +1,7 @@
 name: Build & Publish ZeroTier Docker
 
 # 每周一 03:00 UTC（北京时间 11:00）检查上游最新 Release
-# 也可在 Actions 页面手动点 “Run workflow” 立即检查
+# 也可在 Actions 页面手动点 "Run workflow" 立即检查
 on:
   schedule:
     - cron: "0 3 * * 1"
@@ -16,7 +16,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # 回写 state/version.txt 已构建版本记录
+      contents: write   # 回写版本记录、CHANGELOG，以及创建 GitHub Release
       packages: write   # 推送镜像到 GHCR 所需
 
     steps:
@@ -27,35 +27,94 @@ jobs:
         id: ver
         run: |
           set -euo pipefail
-          V=$(curl -fsSL https://api.github.com/repos/zerotier/ZeroTierOne/releases/latest | jq -r .tag_name)
+          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/zerotier/ZeroTierOne/releases/latest)
+          V=$(echo "$RELEASE_JSON" | jq -r .tag_name)
           if [ -z "$V" ] || [ "$V" = "null" ]; then
             echo "无法获取上游版本号" >&2
             exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "published=$(echo "$RELEASE_JSON" | jq -r .published_at)" >> "$GITHUB_OUTPUT"
+          echo "htmlurl=$(echo "$RELEASE_JSON" | jq -r .html_url)" >> "$GITHUB_OUTPUT"
           echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+          # 保存发布说明正文，供 CHANGELOG 与 Release 复用
+          echo "$RELEASE_JSON" | jq -r '.body // "（该版本未提供发布说明）"' > release-body.txt
           echo "检测到上游最新版本：$V"
 
-      # 2. 先查 GHCR 是否已有该版本镜像，避免每周无意义地重复构建
-      #    公开包可用匿名 token 读取 tags/list
-      - name: 检查 GHCR 是否已有该版本
+      # 2. 检查 GHCR 与 Docker Hub 是否都已收录该版本
+      #    - 任一端缺失即重新构建并双端推送（存量版本也能补推到新接入的 registry）
+      #    - 未配置 Docker Hub 凭据时优雅降级：只处理 GHCR，工作流不报错
+      #    - Docker Hub 仓库需预先在 hub.docker.com 手动创建为 public
+      - name: 检查两端是否已有该版本
         id: check
         env:
           VERSION: ${{ steps.ver.outputs.version }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
           OWNER=${GITHUB_REPOSITORY_OWNER,,}
+
+          # --- GHCR：公开包用匿名 token 读取 tags/list ---
           TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${OWNER}/zerotier:pull" | jq -r .token)
-          TAGS=$(curl -fsSL -H "Authorization: Bearer $TOKEN" \
+          GH_TAGS=$(curl -fsSL -H "Authorization: Bearer $TOKEN" \
             "https://ghcr.io/v2/${OWNER}/zerotier/tags/list" | jq -r '.tags // [] | join(" ")')
-          echo "GHCR 现有标签：$TAGS"
-          if echo " $TAGS " | grep -q " $VERSION "; then
+          echo "GHCR 现有标签：$GH_TAGS"
+          GH_HAS=false
+          if echo " $GH_TAGS " | grep -Fq " $VERSION "; then
+            GH_HAS=true
+          fi
+
+          # --- Docker Hub：配置凭据才检查（公开 API 无需登录）---
+          DH_ENABLED=false
+          DH_HAS=false
+          DH_REPO_CODE="000"
+          DH_CODE="000"
+          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
+            DH_ENABLED=true
+            DH_REPO_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              "https://hub.docker.com/v2/repositories/${DH_USER}/zerotier/")
+            DH_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              "https://hub.docker.com/v2/repositories/${DH_USER}/zerotier/tags/${VERSION}")
+            echo "Docker Hub 仓库 ${DH_USER}/zerotier 状态码：$DH_REPO_CODE"
+            echo "Docker Hub 标签 ${VERSION} 状态码：$DH_CODE"
+            if [ "$DH_REPO_CODE" != "200" ]; then
+              echo "::warning::Docker Hub 仓库 ${DH_USER}/zerotier 不存在，请先在 hub.docker.com 创建同名 public 仓库，否则推送会失败"
+            fi
+            if [ "$DH_CODE" = "200" ]; then
+              DH_HAS=true
+            fi
+          else
+            echo "未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，本次仅处理 GHCR"
+          fi
+
+          # --- 结论：任一端缺失该版本即构建 ---
+          if [ "$GH_HAS" = "true" ] && { [ "$DH_ENABLED" = "false" ] || [ "$DH_HAS" = "true" ]; }; then
             echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "镜像 $VERSION 已存在，跳过重复构建"
+            echo "两端均已收录 $VERSION，跳过重复构建"
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "发现新版本 $VERSION，开始构建"
+            echo "有 registry 缺失 $VERSION，开始构建并双端推送"
           fi
+          # 仓库不存在时不加 Docker Hub tags，也不执行其登录步骤
+          if [ "$DH_ENABLED" = "true" ] && [ "$DH_REPO_CODE" = "200" ]; then
+            echo "dockerhub=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dockerhub=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "dh_user=$DH_USER" >> "$GITHUB_OUTPUT"
+
+          # --- 动态生成 tags（多行输出，凭据缺失时只含 GHCR）---
+          {
+            echo "tags<<TAGS_EOF"
+            echo "ghcr.io/${OWNER}/zerotier:latest"
+            echo "ghcr.io/${OWNER}/zerotier:${VERSION}"
+            if [ "$DH_ENABLED" = "true" ] && [ "$DH_REPO_CODE" = "200" ]; then
+              echo "${DH_USER}/zerotier:latest"
+              echo "${DH_USER}/zerotier:${VERSION}"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       # 3. 从该 tag 下载官方 Dockerfile 和 entrypoint
       #    Dockerfile.release 会从 download.zerotier.com 的 Debian 源
@@ -85,7 +144,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 6. 构建并推送镜像
+      # 5b. 登录 Docker Hub（仅配置了凭据且仓库存在时执行）
+      - uses: docker/login-action@v3
+        if: steps.check.outputs.build == 'true' && steps.check.outputs.dockerhub == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 6. 构建并推送镜像到 GHCR / Docker Hub
       #    DS918+ 是 x86_64，只需 linux/amd64
       - uses: docker/build-push-action@v5
         if: steps.check.outputs.build == 'true'
@@ -95,9 +161,7 @@ jobs:
           build-args: VERSION=${{ steps.ver.outputs.version }}
           platforms: linux/amd64
           push: true
-          tags: |
-            ghcr.io/${{ env.owner }}/zerotier:latest
-            ghcr.io/${{ env.owner }}/zerotier:${{ steps.ver.outputs.version }}
+          tags: ${{ steps.check.outputs.tags }}
 
       # 7. 回写“已构建版本”记录，便于人工核对
       - name: 记录已构建版本
@@ -114,3 +178,179 @@ jobs:
             git commit -m "chore: record built ZeroTier version ${{ steps.ver.outputs.version }}"
             git push
           fi
+
+      # 8. 将该版本追加到 CHANGELOG.md（仅新构建时，按版本号去重）
+      #    条目插在 --- 分隔线之后，顶部说明与脱密 YAML 模板保持不动
+      - name: 更新 CHANGELOG
+        if: steps.check.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          PUBLISHED: ${{ steps.ver.outputs.published }}
+          UPSTREAM_URL: ${{ steps.ver.outputs.htmlurl }}
+          OWNER: ${{ env.owner }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          python3 - <<'PYEOF'
+          import os
+
+          v = os.environ["VERSION"]
+          published = os.environ.get("PUBLISHED", "")[:10]
+          upstream = os.environ.get("UPSTREAM_URL", "")
+          owner = os.environ.get("OWNER", "angussleeping")
+          dh_user = os.environ.get("DH_USER", "")
+          path = "CHANGELOG.md"
+
+          content = open(path, encoding="utf-8").read()
+          if f"## {v} " in content:
+              print(f"CHANGELOG 已含 {v}，跳过")
+              raise SystemExit(0)
+
+          notes = open("release-body.txt", encoding="utf-8").read().strip()
+          note_lines = ["> " + line.strip() if line.strip() else ">" for line in notes.splitlines()]
+
+          lines = [
+              f"## {v} — {published}",
+              "",
+              f"上游发布：{upstream}",
+              "",
+              "更新要点（上游发布说明原文）：",
+              "",
+          ]
+          lines += note_lines
+          lines += [
+              "",
+              "镜像标签：",
+              "",
+              f"- `ghcr.io/{owner}/zerotier:latest`",
+              f"- `ghcr.io/{owner}/zerotier:{v}`",
+          ]
+          if dh_user:
+              lines += [
+                  f"- `{dh_user}/zerotier:latest`（Docker Hub）",
+                  f"- `{dh_user}/zerotier:{v}`（Docker Hub）",
+              ]
+          lines += [
+              "",
+              "群晖升级：Container Manager → 项目 → zerotier → 操作 → 重新构建。群晖容器不会自动更新镜像，需手动执行。",
+              "",
+          ]
+          entry = "\n".join(lines) + "\n"
+
+          marker = "\n---\n"
+          idx = content.find(marker)
+          if idx == -1:
+              print("CHANGELOG 缺少 --- 分隔符，跳过更新")
+              raise SystemExit(0)
+          cut = idx + len(marker)
+          head, tail = content[:cut], content[cut:]
+          open(path, "w", encoding="utf-8").write(head + "\n" + entry + tail.lstrip("\n"))
+          print(f"CHANGELOG 已追加 {v}")
+          PYEOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          if ! git diff --cached --quiet; then
+            git commit -m "docs: add changelog for ZeroTier ${{ steps.ver.outputs.version }}"
+            git push
+          fi
+
+      # 9. 在自建仓库发布 GitHub Release
+      #    独立于构建结果：即使镜像已存在，缺失的 Release 也会补发
+      #    发布正文含版本号、发布日期、更新要点、镜像、手动升级步骤与脱密 YAML
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          PUBLISHED: ${{ steps.ver.outputs.published }}
+          UPSTREAM_URL: ${{ steps.ver.outputs.htmlurl }}
+          OWNER: ${{ env.owner }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION 已存在，跳过"
+            exit 0
+          fi
+
+          python3 - <<'PYEOF' > release-notes.md
+          import os
+
+          v = os.environ["VERSION"]
+          published = os.environ.get("PUBLISHED", "")
+          upstream = os.environ.get("UPSTREAM_URL", "")
+          owner = os.environ.get("OWNER", "angussleeping")
+          dh_user = os.environ.get("DH_USER", "")
+          pull_ref = f"{dh_user}/zerotier:latest" if dh_user else f"ghcr.io/{owner}/zerotier:latest"
+
+          notes = open("release-body.txt", encoding="utf-8").read().strip()
+          yaml_text = open("synology-compose.yaml", encoding="utf-8").read().rstrip()
+
+          lines = [
+              "你好，",
+              "",
+              f"ZeroTier 上游已发布新版本 {v}，自建镜像已构建完成并推送到 GHCR。",
+              "",
+              "### 版本信息",
+              "",
+              f"- 版本号：{v}",
+              f"- 发布日期：{published}",
+              f"- 上游发布：{upstream}",
+              "",
+              "### 关键更新要点",
+              "",
+          ]
+          lines += [line for line in notes.splitlines()]
+          lines += [
+              "",
+              "### 镜像已构建完成",
+              "",
+              f"- `ghcr.io/{owner}/zerotier:latest`",
+              f"- `ghcr.io/{owner}/zerotier:{v}`",
+          ]
+          if dh_user:
+              lines += [
+                  f"- `{dh_user}/zerotier:latest`（Docker Hub，群晖推荐）",
+                  f"- `{dh_user}/zerotier:{v}`（Docker Hub）",
+              ]
+          lines += [
+              "",
+              "### 群晖 DS918+ 升级步骤",
+              "",
+              "群晖容器不会自动更换镜像，必须手动重新构建：",
+              "",
+              "1. Container Manager → 项目 → zerotier → 操作 → 重新构建；",
+              f"2. 或 SSH 执行 `docker pull {pull_ref}`，然后在项目中重新构建。",
+              "",
+              "验证命令：",
+              "",
+              "```bash",
+              "docker exec -it zerotier zerotier-cli -v",
+              "docker exec -it zerotier zerotier-cli listnetworks",
+              "docker exec -it zerotier zerotier-cli peers",
+              "```",
+              "",
+              "### 重要提醒",
+              "",
+              "- 请保留身份数据目录（见下方 YAML 中的 <你的身份数据目录> 占位符），以免节点 ID 变化。",
+              "- 若出现 ACCESS_DENIED，执行 `docker restart zerotier` 即可。",
+              "- 请勿使用 Watchtower 对该容器做无人值守更新。",
+              "",
+              "### 群晖部署 YAML（带注释、已脱密）",
+              "",
+              "把 <你的网络ID> 与 <你的身份数据目录> 替换为自己的实际值：",
+              "",
+              "```yaml",
+          ]
+          lines += yaml_text.splitlines()
+          lines += [
+              "```",
+              "",
+              f"构建记录：https://github.com/{owner}/zerotier-autobuild/actions",
+          ]
+          print("\n".join(lines))
+          PYEOF
+
+          gh release create "$VERSION" \
+            --title "ZeroTier $VERSION" \
+            --notes-file release-notes.md
+          echo "Release $VERSION 已发布"

@@ -1,0 +1,31 @@
+# 群晖 DS918+ / Container Manager 项目部署模板
+# 已脱密：请将 <你的网络ID> 与 <你的身份数据目录> 替换为自己的实际值
+services:
+  zerotier:
+    # 自建镜像，跟随上游版本；Docker Hub 短名，国内拉取更稳
+    # 同一镜像也会同步推送到 ghcr.io/angussleeping/zerotier，可按需替换
+    # 固定 latest，升级时在 Container Manager 手动重新构建（容器不会自动换镜像）
+    image: angussleeping/zerotier:latest
+    # 容器名，验证命令 docker exec -it zerotier ... 会用到
+    container_name: zerotier
+    # 开机自启；异常退出后自动重启
+    restart: always
+    # ZeroTier 需直连宿主机网络，必须用 host 模式
+    network_mode: host
+    # 映射 TUN 虚拟网卡，是建立隧道的必需设备
+    devices:
+      - /dev/net/tun
+    # 授予网络管理能力，用于创建虚拟网卡与路由
+    cap_add:
+      - NET_ADMIN
+    environment:
+      # 时区
+      - TZ=Asia/Shanghai
+      # 要加入的 ZeroTier 网络 ID（已脱密，替换为自己的）
+      - ZEROTIER_JOIN_NETWORKS=<你的网络ID>
+    volumes:
+      # 身份数据目录必须持久化：否则节点 ID 变化，需在 Central 重新授权
+      # 冒号左侧替换为 NAS 上持久化存放身份数据的实际路径
+      - <你的身份数据目录>:/var/lib/zerotier-one
+      # 同步宿主机时区（可选）
+      - /etc/localtime:/etc/localtime:ro
