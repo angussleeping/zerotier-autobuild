@@ -1,0 +1,74 @@
+name: Build & Publish ZeroTier Docker
+
+# 每周一 03:00 UTC（北京时间 11:00）检查一次上游最新 Release
+# 也可在 Actions 页面手动点 “Run workflow” 立即检查
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+# 同一时间只允许一个构建运行，避免重复推送
+concurrency:
+  group: zerotier-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # 推送镜像到 GHCR 所需
+
+    steps:
+      # 1. 读取上游 zerotier/ZeroTierOne 最新稳定版 tag
+      - name: 获取上游最新版本号
+        id: ver
+        run: |
+          set -euo pipefail
+          V=$(curl -fsSL https://api.github.com/repos/zerotier/ZeroTierOne/releases/latest | jq -r .tag_name)
+          if [ -z "$V" ] || [ "$V" = "null" ]; then
+            echo "无法获取上游版本号" >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "检测到上游最新版本：$V"
+          # GHCR 包名只允许小写，先把 owner 转成小写
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
+      # 2. 从该 tag 下载官方 Dockerfile 和 entrypoint
+      #    Dockerfile.release 会从 download.zerotier.com 的 Debian 源
+      #    安装 zerotier-one=${VERSION}，不在群晖本地编译
+      - name: 下载该 tag 的官方构建文件
+        run: |
+          set -euo pipefail
+          V=${{ steps.ver.outputs.version }}
+          mkdir -p ctx
+          curl -fsSL -o ctx/Dockerfile \
+            "https://raw.githubusercontent.com/zerotier/ZeroTierOne/${V}/Dockerfile.release"
+          curl -fsSL -o ctx/entrypoint.sh.release \
+            "https://raw.githubusercontent.com/zerotier/ZeroTierOne/${V}/entrypoint.sh.release"
+          echo "已下载 $V 的构建文件："
+          ls -l ctx
+
+      # 3. 构建环境
+      - uses: docker/setup-buildx-action@v3
+
+      # 4. 登录 GHCR（使用 GitHub 自带的 GITHUB_TOKEN）
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 5. 构建并推送镜像
+      #    DS918+ 是 x86_64，只需 linux/amd64
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./ctx
+          file: ./ctx/Dockerfile
+          build-args: VERSION=${{ steps.ver.outputs.version }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ env.owner }}/zerotier:latest
+            ghcr.io/${{ env.owner }}/zerotier:${{ steps.ver.outputs.version }}
