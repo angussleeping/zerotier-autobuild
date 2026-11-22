@@ -1,6 +1,6 @@
 name: Build & Publish ZeroTier Docker
 
-# 每周一 03:00 UTC（北京时间 11:00）检查一次上游最新 Release
+# 每周一 03:00 UTC（北京时间 11:00）检查上游最新 Release
 # 也可在 Actions 页面手动点 “Run workflow” 立即检查
 on:
   schedule:
@@ -16,10 +16,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # 回写 state/version.txt 已构建版本记录
       packages: write   # 推送镜像到 GHCR 所需
 
     steps:
+      - uses: actions/checkout@v4
+
       # 1. 读取上游 zerotier/ZeroTierOne 最新稳定版 tag
       - name: 获取上游最新版本号
         id: ver
@@ -31,14 +33,35 @@ jobs:
             exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "检测到上游最新版本：$V"
-          # GHCR 包名只允许小写，先把 owner 转成小写
           echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+          echo "检测到上游最新版本：$V"
 
-      # 2. 从该 tag 下载官方 Dockerfile 和 entrypoint
+      # 2. 先查 GHCR 是否已有该版本镜像，避免每周无意义地重复构建
+      #    公开包可用匿名 token 读取 tags/list
+      - name: 检查 GHCR 是否已有该版本
+        id: check
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          OWNER=${GITHUB_REPOSITORY_OWNER,,}
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${OWNER}/zerotier:pull" | jq -r .token)
+          TAGS=$(curl -fsSL -H "Authorization: Bearer $TOKEN" \
+            "https://ghcr.io/v2/${OWNER}/zerotier/tags/list" | jq -r '.tags // [] | join(" ")')
+          echo "GHCR 现有标签：$TAGS"
+          if echo " $TAGS " | grep -q " $VERSION "; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "镜像 $VERSION 已存在，跳过重复构建"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "发现新版本 $VERSION，开始构建"
+          fi
+
+      # 3. 从该 tag 下载官方 Dockerfile 和 entrypoint
       #    Dockerfile.release 会从 download.zerotier.com 的 Debian 源
       #    安装 zerotier-one=${VERSION}，不在群晖本地编译
       - name: 下载该 tag 的官方构建文件
+        if: steps.check.outputs.build == 'true'
         run: |
           set -euo pipefail
           V=${{ steps.ver.outputs.version }}
@@ -50,19 +73,22 @@ jobs:
           echo "已下载 $V 的构建文件："
           ls -l ctx
 
-      # 3. 构建环境
+      # 4. 构建环境
       - uses: docker/setup-buildx-action@v3
+        if: steps.check.outputs.build == 'true'
 
-      # 4. 登录 GHCR（使用 GitHub 自带的 GITHUB_TOKEN）
+      # 5. 登录 GHCR（使用 GitHub 自带的 GITHUB_TOKEN）
       - uses: docker/login-action@v3
+        if: steps.check.outputs.build == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 5. 构建并推送镜像
+      # 6. 构建并推送镜像
       #    DS918+ 是 x86_64，只需 linux/amd64
       - uses: docker/build-push-action@v5
+        if: steps.check.outputs.build == 'true'
         with:
           context: ./ctx
           file: ./ctx/Dockerfile
@@ -72,3 +98,19 @@ jobs:
           tags: |
             ghcr.io/${{ env.owner }}/zerotier:latest
             ghcr.io/${{ env.owner }}/zerotier:${{ steps.ver.outputs.version }}
+
+      # 7. 回写“已构建版本”记录，便于人工核对
+      - name: 记录已构建版本
+        if: steps.check.outputs.build == 'true'
+        run: |
+          mkdir -p state
+          echo "${{ steps.ver.outputs.version }}" > state/version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/version.txt
+          if git diff --cached --quiet; then
+            echo "版本记录无变化"
+          else
+            git commit -m "chore: record built ZeroTier version ${{ steps.ver.outputs.version }}"
+            git push
+          fi

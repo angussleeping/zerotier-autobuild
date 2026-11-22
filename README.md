@@ -2,11 +2,13 @@
 
 自建 ZeroTier Docker 镜像仓库：跟随 ZeroTier 官方 GitHub Release，自动构建并推送到 GHCR，供群晖 Container Manager 使用。
 
+仓库地址：https://github.com/angussleeping/zerotier-autobuild
+
 ## 仓库结构
 
 ```text
-.github/workflows/build.yml   # GitHub Actions：每周检查上游 Release 并构建镜像
-state/version.txt             # WorkBuddy 邮件通知自动化用来记录“上次已通知版本”
+.github/workflows/build.yml   # GitHub Actions：每周检查上游 Release，有新版本才构建
+state/version.txt             # 已构建版本记录（由 Actions 自动回写）
 README.md                     # 本说明
 ```
 
@@ -15,13 +17,15 @@ README.md                     # 本说明
 1. 每周一 03:00 UTC（北京时间 11:00）自动运行一次，也可在 Actions 页面手动点 **Run workflow**。
 2. 读取上游最新版本：
    `https://api.github.com/repos/zerotier/ZeroTierOne/releases/latest`
-3. 下载该 tag 的官方 `Dockerfile.release` 和 `entrypoint.sh.release`。
-4. 用 `--build-arg VERSION=<版本号>` 构建镜像。构建过程在 GitHub 服务器上进行，不在群晖本地编译，因此不受国内访问 `download.zerotier.com` 速度影响。
-5. 推送镜像到 GHCR，同时打两个 tag：
+3. 用匿名 token 查询 GHCR 的 `tags/list`。如果该版本镜像已存在，直接跳过构建；不存在才继续。
+4. 下载该 tag 的官方 `Dockerfile.release` 和 `entrypoint.sh.release`。
+5. 用 `--build-arg VERSION=<版本号>` 构建镜像。构建在 GitHub 服务器上完成，不在群晖本地编译，不受国内访问 `download.zerotier.com` 速度影响。
+6. 推送镜像到 GHCR，同时打两个 tag：
    - `ghcr.io/angussleeping/zerotier:latest`
    - `ghcr.io/angussleeping/zerotier:<版本号>`，例如 `ghcr.io/angussleeping/zerotier:1.16.2`
+7. 把版本号回写到 `state/version.txt`，便于人工核对。
 
-> 当前上游最新稳定版为 **1.16.2**（发布于 2026-05-28）。
+> 当前上游最新稳定版为 **1.16.2**（发布于 2026-05-28）。首次构建已完成，GHCR 中已有 `latest` 和 `1.16.2` 两个标签。
 
 ## 在群晖上使用
 
@@ -68,25 +72,32 @@ services:
 
 GitHub Actions 推送新镜像后，群晖容器**不会自动更新**。请手动操作：
 
-1. Container Manager → 项目 → 选择 `zerotier` → 操作 → 重新构建。
+1. 收到更新邮件后，Container Manager → 项目 → 选择 `zerotier` → 操作 → **重新构建**。
 2. 或 SSH：`docker pull ghcr.io/angussleeping/zerotier:latest` 后，在项目里重新构建。
+3. 验证：
+   ```bash
+   docker exec -it zerotier zerotier-cli -v
+   docker exec -it zerotier zerotier-cli listnetworks
+   docker exec -it zerotier zerotier-cli peers
+   ```
 
 不建议用 Watchtower 无人值守自动更新关键网络容器——你之前刚经历过 Container Manager 崩溃，手动确认更稳妥。
 
 ## 邮件更新通知
 
-WorkBuddy 中已配置每周自动化任务：
+WorkBuddy 中已配置每周一 12:00（北京时间，紧接镜像构建之后）的自动化任务，它会：
 
-- 每周检查上游最新 Release；
-- 与 `state/version.txt` 中记录的版本比较；
-- 若发现新版本，发送邮件提醒你到群晖上重新构建 ZeroTier 项目；
-- 发信后更新 `state/version.txt`，避免重复提醒。
+1. 查询上游最新 Release 版本；
+2. 查询 GHCR 中 `angussleeping/zerotier` 的标签，确认新镜像是否已构建完成；
+3. 与本地通知记录 `state/notified-version.txt` 比较；
+4. 只有出现新版本时才发邮件到 **angus-sleeping@hotmail.com**，内容包括版本号、更新要点、群晖拉取命令和 Container Manager 重新构建步骤；
+5. 发信后更新通知记录，避免重复提醒；若镜像尚未构建完成，则邮件说明构建中并给出 Actions 页面链接。
 
 如果收不到邮件，请检查：
 
-1. WorkBuddy 的 Agent Mail 是否已开通；
+1. WorkBuddy 的 **Agent Mail** 是否已开通（当前尚未开通，需要先在「更多 → 我的邮箱」开通）；
 2. 自动化任务是否处于 ACTIVE 状态；
-3. 通知邮箱是否正确。
+3. 通知邮箱是否为 `angus-sleeping@hotmail.com`。
 
 ## 注意事项
 
