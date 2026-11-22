@@ -75,21 +75,9 @@ jobs:
             DH_REPO_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
               "https://hub.docker.com/v2/repositories/${DH_USER}/zerotier/")
 
-            # 仓库不存在时，用 PAT 通过 Docker Hub API 自动创建同名 public 仓库
+            # Docker Hub 仓库需事先在网页手动创建为 public；PAT 无法用于 hub API 自动建仓
             if [ "$DH_REPO_CODE" != "200" ]; then
-              echo "Docker Hub 仓库 ${DH_USER}/zerotier 不存在，尝试自动创建 public 仓库"
-              CREATE_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-                -X POST "https://hub.docker.com/v2/repositories/" \
-                -H "Authorization: Bearer $DH_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "{\"name\":\"zerotier\",\"namespace\":\"${DH_USER}\",\"is_private\":false,\"description\":\"ZeroTier mirror built from official release\"}")
-              echo "自动创建仓库状态码：$CREATE_CODE"
-              # 201=新建成功，200=已存在，409=同名冲突（均视为可用）
-              if [ "$CREATE_CODE" = "201" ] || [ "$CREATE_CODE" = "200" ] || [ "$CREATE_CODE" = "409" ]; then
-                DH_REPO_CODE="200"
-              else
-                echo "::warning::无法自动创建 Docker Hub 仓库（状态码 $CREATE_CODE），请手动在 hub.docker.com 创建 ${DH_USER}/zerotier 的 public 仓库"
-              fi
+              echo "::warning::Docker Hub 仓库 ${DH_USER}/zerotier 不存在，请在 hub.docker.com 手动创建同名 public 仓库；本次仅推送 GHCR"
             fi
 
             DH_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
